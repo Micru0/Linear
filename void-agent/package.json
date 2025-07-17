@@ -1,0 +1,23 @@
+{
+  "name": "void-agent",
+  "version": "1.0.0",
+  "main": "src/worker.ts",
+  "scripts": {
+    "test": "vitest"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@linear/sdk": "^1.29.0",
+    "openai": "^4.52.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240512.0",
+    "typescript": "^5.4.5",
+    "vitest": "^1.6.0",
+    "wrangler": "^3.57.2"
+  }
+}

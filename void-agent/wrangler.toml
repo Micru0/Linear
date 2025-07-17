@@ -1,0 +1,24 @@
+name = "void-agent"
+main = "src/worker.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# Variables and secrets
+[vars]
+# The model to use for OpenAI API calls.
+OPENAI_MODEL = "gpt-4o-mini"
+
+# KV Namespace for storing team rules and other knowledge base data.
+# Create one with `wrangler kv:namespace create TEAM_RULES_KV`
+# And add the resulting `id` and `preview_id` here.
+[[kv_namespaces]]
+binding = "TEAM_RULES_KV"
+id = "dd5c12a41130488da5ca447e14678a50"
+preview_id = "72a7ebf18e09466687b9b4dc7b29dacc"
+
+# Secrets are configured using `wrangler secret put <KEY>`.
+# The following secrets are expected:
+# - LINEAR_API_KEY: Your Linear API key with agent permissions.
+# - OPENAI_API_KEY: Your OpenAI API key.
+# - LINEAR_SIGNING_SECRET: The webhook signing secret from Linear.
+# - AWAITING_INFO_LABEL_ID: The UUID of the "Awaiting Info" label.

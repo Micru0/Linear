@@ -1,0 +1,148 @@
+# Void Auto-Triage Agent: Developer Log & Documentation Notes
+
+This document provides a comprehensive overview of the Void Auto-Triage Agent, its architecture, and the steps required for setup, deployment, and maintenance.
+
+---
+
+## 1. Project Overview
+
+**Purpose:** The Void Auto-Triage Agent is a Cloudflare Worker designed to automate the initial triage process for new issues in a Linear workspace.
+
+**Core Functionality:**
+-   **Watches for New Issues & Comments:** Triggered by Linear webhooks for both issue and comment creation events.
+-   **Classifies & Routes:** Assigns the issue to the correct team based on a configurable knowledge base.
+-   **Applies Metadata:** Adds relevant labels, priorities, and story point estimates.
+-   **Breaks Down Epics:** Can create subtasks for large, complex issues.
+-   **Asks for Clarification:** If an issue is ambiguous, it will post a comment asking for more information and apply a special label (e.g., "Status: Awaiting Info").
+-   **Handles Conversations:** When a user replies to a clarification question, the agent reads the new comment, re-evaluates the issue with the new information, and completes the triage.
+-   **Validates Labels:** It cross-references all AI-suggested labels against the workspace's actual label list to prevent errors from "hallucinated" labels.
+-   **Secure & Robust:** Verifies incoming webhook requests using an HMAC-SHA256 signature and processes all tasks in the background to prevent timeouts.
+
+---
+
+## 2. System Architecture
+
+The agent operates on a serverless, event-driven architecture.
+
+**Workflow:**
+1.  **Trigger:** A user creates an issue in a monitored Linear team, or replies to one of the agent's clarification questions.
+2.  **Webhook:** Linear sends a webhook payload to the agent's public Cloudflare Worker URL.
+3.  **Verification & Acknowledgement:** The agent first verifies the `linear-signature` header. It computes an HMAC-SHA256 hash of the raw request body using the shared `LINEAR_SIGNING_SECRET` and compares it to the signature sent by Linear. If they match, the request is considered legitimate. It then immediately sends a "200 OK" response to Linear to prevent timeouts. The rest of the processing happens in the background.
+4.  **Routing:**
+    -   If the webhook is for a **new issue**, the agent proceeds to the Triage step.
+    -   If the webhook is for a **new comment**, the agent first checks if the comment contains a special invisible marker (`<!-- bot -->`) to avoid reacting to its own messages. If the comment is from a user and on an issue that has the "Awaiting Info" label, it proceeds to the Triage step, armed with the new information from the conversation.
+5.  **Triage & Knowledge Base Fetch:**
+    -   The agent loads two knowledge bases from a Cloudflare KV namespace: `team_rules.json` (for team routing) and `labels.json` (the list of all available labels).
+    -   It combines the issue details, conversation history (if any), and both knowledge bases into a detailed system prompt.
+    -   This prompt is sent to the OpenAI GPT-4o API.
+6.  **Triage Plan & Validation:**
+    -   OpenAI returns a structured JSON object (`TriagePlan`) containing the proposed changes (team, labels, priority, etc.).
+    -   The agent validates all `labelIds` from the plan against its knowledge base to ensure they are real.
+7.  **Execution:**
+    -   If the plan requires more information, the agent posts the `clarificationComment` (which includes the invisible `<!-- bot -->` marker) and applies the `AWAITING_INFO_LABEL_ID` to the issue.
+    -   If the plan is complete, the agent uses the Linear API to update the issue, create subtasks, and add a ✅ reaction to signify completion.
+
+**Technology Stack:**
+-   **Runtime:** Cloudflare Worker (TypeScript)
+-   **LLM:** OpenAI GPT-4o
+-   **Linear API:** GraphQL via the `@linear/sdk`
+-   **Storage:** Cloudflare KV for knowledge bases.
+-   **Deployment:** Wrangler CLI
+
+---
+
+## 3. Project File Structure
+
+-   `/void-agent`
+    -   `wrangler.toml`: The configuration file for the Cloudflare Worker. Defines the worker name, entrypoint, compatibility flags, and bindings for secrets and KV.
+    -   `package.json`: Manages project dependencies and scripts (`test`, `dev`, `deploy`).
+    -   `team_rules.json`: **(Manual setup required)** A user-defined JSON file that maps teams to keywords and domains. This is the core of the agent's routing logic.
+    -   `labels.json`: **(Auto-generated then stored)** A JSON file containing the ID and name of every label in your Linear workspace. This is required for the agent to assign labels.
+    -   `/src`
+        -   `worker.ts`: The main entry point for the agent. It contains the `fetch` handler that receives webhooks, orchestrates calls to other modules, and executes the triage plan. It also contains the webhook signature verification logic.
+        -   `linear.ts`: A module that abstracts all interactions with the Linear GraphQL API. It provides functions like `updateIssue`, `createComment`, etc.
+        -   `llm.ts`: Handles all interactions with the OpenAI API. It defines the Zod schema for the `TriagePlan` and contains the function to get the plan from the LLM.
+        -   `kb.ts`: A small utility module for fetching and parsing the knowledge base files from the Cloudflare KV namespace. It also contains the label validation logic.
+    -   `/src/tests`
+        -   `worker.test.ts`: Integration tests for the worker, mocking the APIs and KV to ensure the logic works as expected.
+
+---
+
+## 4. Setup & Deployment Guide
+
+### Step 1: Initial Setup
+1.  Clone the repository and `cd` into the `void-agent` directory.
+2.  Run `npm install`.
+
+### Step 2: Configure Secrets
+Use the Wrangler CLI to set the following secrets. These are stored securely by Cloudflare and are not checked into source control. You must set all four for the agent to function correctly.
+
+-   **`LINEAR_API_KEY`**: Your personal Linear API key.
+    -   `npx wrangler secret put LINEAR_API_KEY`
+-   **`OPENAI_API_KEY`**: Your OpenAI API key.
+    -   `npx wrangler secret put OPENAI_API_KEY`
+-   **`LINEAR_SIGNING_SECRET`**: The webhook signing secret from your Linear webhook settings.
+    -   `npx wrangler secret put LINEAR_SIGNING_SECRET`
+-   **`AWAITING_INFO_LABEL_ID`**: The UUID of the label the agent uses to mark issues that are pending a reply (e.g., "Status: Awaiting Info").
+    -   `npx wrangler secret put AWAITING_INFO_LABEL_ID`
+
+### Step 3: Configure Cloudflare KV
+1.  Create two KV namespaces (one for production, one for preview):
+    -   `npx wrangler kv:namespace create TEAM_RULES_KV`
+    -   `npx wrangler kv:namespace create TEAM_RULES_KV --preview`
+2.  Copy the generated IDs into your `wrangler.toml` file.
+
+### Step 4: Configure Knowledge Base
+1.  **Define Team Rules:**
+    -   Open `team_rules.json` and map your Linear Team IDs to relevant `keywords` and `domains` to guide the agent's routing logic.
+2.  **Generate Labels List:**
+    -   Run the following `curl` command, **replacing `YOUR_LINEAR_API_KEY` with the same key you used in Step 2.1**, to generate a `labels.json` file.
+        ```bash
+        curl -X POST -H "Content-Type: application/json" -H "Authorization: YOUR_LINEAR_API_KEY" --data '{ "query": "query { issueLabels { nodes { id name } } }" }' https://api.linear.app/graphql > labels.json
+        ```
+3.  **Create "Awaiting Info" Label:**
+    -   In your Linear workspace, create a new label specifically for the agent to use when it is waiting for a reply (e.g., "Status: Awaiting Info").
+    -   Find its ID in the `labels.json` file you just generated and set it as a secret using the command in Step 2.
+
+### Step 5: Upload Knowledge Base to KV
+Upload your `team_rules.json` and `labels.json` files to both your production and preview KV namespaces using the `wrangler kv:key put` command.
+
+### Step 6: Deploy & Test (Live Workflow)
+The most effective way to test the agent is to deploy it to Cloudflare and monitor its behavior in a real Linear workspace using live logs.
+
+1.  **Start Log Tailing:**
+    -   Open a terminal window and navigate to the `void-agent` directory.
+    -   Run `npx wrangler tail`. This command connects to your deployed worker and streams its logs in real-time. Keep this window open to monitor the agent's activity.
+
+2.  **Deploy the Agent:**
+    -   Open a **second terminal window** and navigate to the `void-agent` directory.
+    -   Run `npx wrangler deploy`. This will upload the latest version of your code to Cloudflare.
+
+3.  **Trigger the Agent:**
+    -   In your Linear workspace, create a new issue with a title or description that matches keywords in your `team_rules.json` file (e.g., "Fix a UI bug on the login page").
+    -   If you are testing the conversational flow, reply to a clarification question the agent has posted.
+
+4.  **Observe the Outcome:**
+    -   **In the `wrangler tail` terminal:** Watch for logs detailing the agent's process. You will see the incoming webhook, the generated triage plan, and confirmations of actions taken. Any errors will also be printed here.
+    -   **In Linear:** Check if the issue was correctly assigned, labeled, and received a ✅ reaction. If the agent asked a question, check for the comment and the "Awaiting Info" label.
+
+This workflow provides immediate feedback and is the recommended way to validate changes.
+
+
+### Step 7: Configure Linear Webhook
+1.  In Linear, go to **Settings > API > Webhooks**.
+2.  Create a new webhook pointing to your worker's URL.
+3.  Ensure it is subscribed to both **`Issues`** and **`Comment`** data change events. This is required for the conversational features to work.
+4.  Save the webhook, using the provided signing secret.
+
+---
+
+## 5. Maintenance & Customization
+
+-   **Improving Triage Accuracy:** The agent's accuracy depends on its instructions.
+    -   **For Team Routing:** Refine the `keywords` in `team_rules.json`.
+    -   **For Label, Priority & Estimate Assignment:** The best way to improve the agent's decision-making is to adjust the `SYSTEM_PROMPT` in `src/worker.ts`. You can add rules, provide better examples, or change its tone. For example, to improve estimates, you could add: "For estimates, use this guide: 1 for simple tasks, 3 for multi-step tasks, 8 for complex projects."
+-   **Changing Agent Behavior:** The `SYSTEM_PROMPT` is the agent's "brain." Modifying it can significantly change how the agent behaves. Be aware that the agent identifies its own clarification comments by looking for an invisible `<!-- bot -->` HTML comment at the end. If you change the clarification prompt, ensure this marker is preserved, or the agent may get stuck in a loop.
+-   **Updating Workspace Labels:** If you change labels in Linear, you must regenerate `labels.json` (Step 4.2) and re-upload it to KV (Step 5). The agent will not see new labels otherwise.
+-   **Deploying Changes:** After making any changes to the code or knowledge bases, you must run `npx wrangler deploy` for them to take effect.
+-   **Updating Dependencies:** Periodically run `npm outdated` and `npm update`. 
